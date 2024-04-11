@@ -1080,6 +1080,25 @@ def launch_cutechess(
         w_params = req["w_params"]
         b_params = req["b_params"]
 
+        def generate_tune_options(params):
+            options = [
+                "{},{}".format(
+                    param["name"], math.floor(param["value"] + random.uniform(0, 1))
+                )
+                for param in params
+            ]
+            return ",".join(options)
+
+        # Generate option strings for white and black parameters
+        w_tune_options = generate_tune_options(w_params)
+        b_tune_options = generate_tune_options(b_params)
+
+        # Write option names and values to a file
+        with open("w_tune_options.csv", "w") as f:
+            f.write(w_tune_options)
+
+        with open("b_tune_options.csv", "w") as f:
+            f.write(b_tune_options)
     else:
         w_params = []
         b_params = []
@@ -1088,23 +1107,13 @@ def launch_cutechess(
     idx = cmd.index("_spsa_")
     cmd = (
         cmd[:idx]
-        + [
-            "option.{}={}".format(
-                x["name"], x["value"]
-            )
-            for x in w_params
-        ]
+        + (["option.TuneFile=w_tune_options.csv"] if len(w_params) != 0 else [])
         + cmd[idx + 1 :]
     )
     idx = cmd.index("_spsa_")
     cmd = (
         cmd[:idx]
-        + [
-            "option.{}={}".format(
-                x["name"], x["value"]
-            )
-            for x in b_params
-        ]
+        + (["option.TuneFile=b_tune_options.csv"] if len(b_params) != 0 else [])
         + cmd[idx + 1 :]
     )
 
