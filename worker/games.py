@@ -1083,7 +1083,7 @@ def launch_cutechess(
         def generate_tune_options(params):
             options = [
                 "{},{}".format(
-                    param["name"], math.floor(param["value"] + random.uniform(0, 1))
+                    param["name"], param["value"]
                 )
                 for param in params
             ]
