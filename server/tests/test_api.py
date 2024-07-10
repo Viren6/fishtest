@@ -6,7 +6,7 @@ import sys
 import unittest
 from datetime import datetime, timezone
 
-from fishtest.api import WORKER_VERSION, UserApi, WorkerApi
+from montytest.api import WORKER_VERSION, UserApi, WorkerApi
 from pyramid.httpexceptions import HTTPBadRequest, HTTPUnauthorized
 from pyramid.testing import DummyRequest
 from util import get_rundb
@@ -46,8 +46,8 @@ def new_run(self, add_tasks=0):
         msg_new="Super stuff",
         base_signature="123456",
         new_signature="654321",
-        base_nets=["nn-0000000000a0.nnue"],
-        new_nets=["nn-0000000000a0.nnue", "nn-0000000000a1.nnue"],
+        base_nets=["nn-0000000000a0.network"],
+        new_nets=["nn-0000000000a0.network", "nn-0000000000a1.network"],
         rescheduled_from="653db116cc309ae839563103",
         base_same_as_master=False,
         tests_repo="https://google.com",
@@ -124,12 +124,12 @@ class TestApi(unittest.TestCase):
                 sys.version_info.minor,
                 sys.version_info.micro,
             ],
-            "gcc_version": [
-                9,
-                3,
+            "cargo_version": [
+                1,
+                78,
                 0,
             ],
-            "compiler": "g++",
+            "compiler": "cargo",
             "unique_key": "amaya-5a28-4b7d-b27b-d78d97ecf11a",
             "modified": True,
             "near_github_api_limit": False,
@@ -140,7 +140,7 @@ class TestApi(unittest.TestCase):
             cls.username,
             cls.password,
             "email@email.email",
-            "https://github.com/official-stockfish/Stockfish",
+            "https://github.com/official-monty/Monty",
         )
         user = cls.rundb.userdb.get_user(cls.username)
         user["pending"] = False
@@ -512,12 +512,12 @@ class TestRunFinished(unittest.TestCase):
                 sys.version_info.minor,
                 sys.version_info.micro,
             ],
-            "gcc_version": [
-                9,
-                3,
+            "cargo_version": [
+                1,
+                78,
                 0,
             ],
-            "compiler": "g++",
+            "compiler": "cargo",
             "unique_key": "amaya-5a28-4b7d-b27b-d78d97ecf11a",
             "near_github_api_limit": False,
             "modified": True,
@@ -528,7 +528,7 @@ class TestRunFinished(unittest.TestCase):
             cls.username,
             cls.password,
             "email@email.email",
-            "https://github.com/official-stockfish/Stockfish",
+            "https://github.com/official-monty/Monty",
         )
         user = cls.rundb.userdb.get_user(cls.username)
         user["pending"] = False

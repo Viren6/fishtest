@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pymongo
-from fishtest.util import worker_name
+from montytest.util import worker_name
 
 
 def show(p):
@@ -39,6 +39,7 @@ run_default = {
         "itp": 100.0,
         "priority": 0,
         "adjudication": True,
+        "datagen": False,
     },
     "start_time": datetime.min,
     "last_updated": datetime.min,
@@ -68,7 +69,7 @@ worker_info_default = {
     "username": "Unknown_worker",
     "version": 0,
     "python_version": [],
-    "gcc_version": [],
+    "cargo_version": [],
     "unique_key": "xxxxxxxx",
     "rate": {"limit": 5000, "remaining": 5000},
     "ARCH": "?",
@@ -101,7 +102,7 @@ def convert_run(run):
 
 if __name__ == "__main__":
     client = pymongo.MongoClient()
-    runs_collection = client["fishtest_new"]["runs"]
+    runs_collection = client["montytest_new"]["runs"]
     runs = runs_collection.find({}).sort("_id", 1)
     count = 0
     print("Starting conversion...")

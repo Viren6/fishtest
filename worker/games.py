@@ -17,7 +17,6 @@ import tempfile
 import threading
 import time
 from base64 import b64decode
-from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -25,6 +24,7 @@ from zipfile import ZipFile
 
 import requests
 
+BASELINE_NPS = 184087
 IS_WINDOWS = "windows" in platform.system().lower()
 IS_MACOS = "darwin" in platform.system().lower()
 LOGFILE = "api.log"
@@ -233,7 +233,7 @@ def github_api(repo):
 
 def required_nets(engine):
     nets = {}
-    pattern = re.compile(r"(EvalFile\w*)\s+.*\s+(nn-[a-f0-9]{12}.nnue)")
+    pattern = re.compile(r"(EvalFile\w*)\s+.*\s+(nn-[a-f0-9]{12}.network)")
     print("Obtaining EvalFile of {} ...".format(os.path.basename(engine)))
     try:
         with subprocess.Popen(
@@ -261,29 +261,26 @@ def required_nets(engine):
     return nets
 
 
-def required_nets_from_source():
-    """Parse evaluate.h and ucioption.cpp to find default nets"""
-    nets = []
-    pattern = re.compile("nn-[a-f0-9]{12}.nnue")
-    # NNUE code after binary embedding (Aug 2020)
-    with open("evaluate.h", "r") as srcfile:
+def required_value_from_source():
+    pattern = re.compile("nn-[a-f0-9]{12}.network")
+
+    with open("src/networks/value.rs", "r") as srcfile:
         for line in srcfile:
-            if "EvalFileDefaultName" in line and "define" in line:
+            if "ValueFileDefaultName" in line:
                 m = pattern.search(line)
                 if m:
-                    nets.append(m.group(0))
-    if nets:
-        return nets
+                    return m.group(0)
 
-    # NNUE code before binary embedding (Aug 2020)
-    with open("ucioption.cpp", "r") as srcfile:
+
+def required_policy_from_source():
+    pattern = re.compile("nn-[a-f0-9]{12}.network")
+
+    with open("src/networks/policy.rs", "r") as srcfile:
         for line in srcfile:
-            if "EvalFile" in line and "Option" in line:
+            if "PolicyFileDefaultName" in line:
                 m = pattern.search(line)
                 if m:
-                    nets.append(m.group(0))
-
-    return nets
+                    return m.group(0)
 
 
 def download_net(remote, testing_dir, net):
@@ -324,100 +321,71 @@ def establish_validated_net(remote, testing_dir, net):
                 time.sleep(waitTime)
 
 
-def verify_signature(engine, signature, active_cores):
-    cpu_features = "?"
-    with subprocess.Popen(
-        [engine, "compiler"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        universal_newlines=True,
-        bufsize=1,
-        close_fds=not IS_WINDOWS,
-    ) as p:
+def run_single_bench(engine, queue):
+    bench_sig = None
+    bench_nps = None
+
+    try:
+        p = subprocess.Popen(
+            [engine, "bench"],
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1,
+            close_fds=not IS_WINDOWS,
+        )
+
         for line in iter(p.stdout.readline, ""):
-            if "settings" in line:
-                cpu_features = line.split(": ")[1].strip()
-    if p.returncode:
-        raise WorkerException(
-            "Compiler info exited with non-zero code {}".format(
-                format_return_code(p.returncode)
-            )
+            if "Bench: " in line:
+                spl = line.split(" ")
+                bench_sig = int(spl[1].strip())
+                bench_nps = float(spl[3].strip())
+
+        queue.put((bench_sig, bench_nps))
+    except:
+        queue.put((None, None))
+
+
+def verify_signature(engine, signature, active_cores):
+    queue = multiprocessing.Queue()
+
+    processes = [
+        multiprocessing.Process(
+            target=run_single_bench,
+            args=(engine, queue),
         )
+        for _ in range(active_cores)
+    ]
 
-    with ExitStack() as stack:
-        if active_cores > 1:
-            busy_process = stack.enter_context(
-                subprocess.Popen(
-                    [engine],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    universal_newlines=True,
-                    bufsize=1,
-                    close_fds=not IS_WINDOWS,
-                )
-            )
-            busy_process.stdin.write(
-                "setoption name Threads value {}\n".format(active_cores - 1)
-            )
-            busy_process.stdin.write("go infinite\n")
-            busy_process.stdin.flush()
-            time.sleep(1)  # wait CPU loading
+    for p in processes:
+        p.start()
 
-        bench_sig = None
-        bench_nps = None
-        print("Verifying signature of {} ...".format(os.path.basename(engine)))
-        p = stack.enter_context(
-            subprocess.Popen(
-                [engine, "bench"],
-                stderr=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                universal_newlines=True,
-                bufsize=1,
-                close_fds=not IS_WINDOWS,
-            )
-        )
-        for line in iter(p.stderr.readline, ""):
-            if "Nodes searched" in line:
-                bench_sig = line.split(": ")[1].strip()
-            if "Nodes/second" in line:
-                bench_nps = float(line.split(": ")[1].strip())
+    results = [queue.get() for _ in range(active_cores)]
+    bench_nps = 0.0
 
-        if active_cores > 1:
-            busy_process.communicate("quit\n")
+    for sig, nps in results:
+        bench_nps += nps
 
-    if p.returncode != 0:
-        if p.returncode == 1:  # EXIT_FAILURE
+        if sig is None or bench_nps is None:
             raise RunException(
-                "Bench of {} exited with EXIT_FAILURE".format(os.path.basename(engine))
-            )
-        else:  # Signal? It could be user generated so be careful.
-            raise WorkerException(
-                "Bench of {} exited with error code {}".format(
-                    os.path.basename(engine), format_return_code(p.returncode)
-                )
+                "Unable to parse bench output of {}".format(os.path.basename(engine))
             )
 
-    # Now we know that bench finished without error we check that its
-    # output is correct.
+        if int(sig) != int(signature):
+            message = "Wrong bench in {}, user expected: {} but worker got: {}".format(
+                os.path.basename(engine),
+                signature,
+                sig,
+            )
+            raise RunException(message)
 
-    if bench_sig is None or bench_nps is None:
-        raise RunException(
-            "Unable to parse bench output of {}".format(os.path.basename(engine))
-        )
+    bench_nps /= active_cores
 
-    if int(bench_sig) != int(signature):
-        message = "Wrong bench in {}, user expected: {} but worker got: {}".format(
-            os.path.basename(engine),
-            signature,
-            bench_sig,
-        )
-        raise RunException(message)
-
-    return bench_nps, cpu_features
+    return bench_nps
 
 
 def download_from_github_raw(
-    item, owner="official-stockfish", repo="books", branch="master"
+    item, owner="official-monty", repo="books", branch="master"
 ):
     item_url = "{}/{}/{}/{}/{}".format(RAWCONTENT_HOST, owner, repo, branch, item)
     print("Downloading {}".format(item_url))
@@ -425,7 +393,7 @@ def download_from_github_raw(
 
 
 def download_from_github_api(
-    item, owner="official-stockfish", repo="books", branch="master"
+    item, owner="official-monty", repo="books", branch="master"
 ):
     item_url = "{}/repos/{}/{}/contents/{}?ref={}".format(
         API_HOST, owner, repo, item, branch
@@ -435,9 +403,7 @@ def download_from_github_api(
     return b64decode(requests_get(git_url, timeout=HTTP_TIMEOUT).json()["content"])
 
 
-def download_from_github(
-    item, owner="official-stockfish", repo="books", branch="master"
-):
+def download_from_github(item, owner="official-monty", repo="books", branch="master"):
     try:
         blob = download_from_github_raw(item, owner=owner, repo=repo, branch=branch)
     except FatalException:
@@ -480,193 +446,8 @@ def convert_book_move_counters(book_file):
             file.write(epd + "\n")
 
 
-def clang_props():
-    """Parse the output of clang++ -E - -march=native -### and extract the available clang properties"""
-    with subprocess.Popen(
-        ["clang++", "-E", "-", "-march=native", "-###"],
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-        bufsize=1,
-        close_fds=not IS_WINDOWS,
-    ) as p:
-        for line in iter(p.stderr.readline, ""):
-            if "cc1" in line:
-                tokens = line.split('" "')
-                arch = [
-                    tokens[i + 1]
-                    for i, token in enumerate(tokens)
-                    if token == "-target-cpu"
-                ]
-                arch = arch[0] if len(arch) else "None"
-                flags = [
-                    tokens[i + 1]
-                    for i, token in enumerate(tokens)
-                    if token == "-target-feature"
-                ]
-                flags = [flag[1:] for flag in flags if flag[0] == "+"]
-
-    if p.returncode != 0:
-        raise FatalException(
-            "clang++ target query failed with return code {}".format(
-                format_return_code(p.returncode)
-            )
-        )
-
-    return {"flags": flags, "arch": arch}
-
-
-def gcc_props():
-    """Parse the output of g++ -Q -march=native --help=target and extract the available gcc properties"""
-    with subprocess.Popen(
-        ["g++", "-Q", "-march=native", "--help=target"],
-        stdout=subprocess.PIPE,
-        universal_newlines=True,
-        bufsize=1,
-        close_fds=not IS_WINDOWS,
-    ) as p:
-        flags = []
-        arch = "None"
-        for line in iter(p.stdout.readline, ""):
-            if "[enabled]" in line:
-                flags.append(line.split()[0][2:])
-            if "-march" in line and len(line.split()) == 2:
-                arch = line.split()[1]
-
-    if p.returncode != 0:
-        raise FatalException(
-            "g++ target query failed with return code {}".format(
-                format_return_code(p.returncode)
-            )
-        )
-
-    return {"flags": flags, "arch": arch}
-
-
-def make_targets():
-    """Parse the output of make help and extract the available targets"""
-    try:
-        with subprocess.Popen(
-            ["make", "help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1,
-            close_fds=not IS_WINDOWS,
-        ) as p:
-            targets = []
-            read_targets = False
-
-            for line in iter(p.stdout.readline, ""):
-                if "Supported compilers:" in line:
-                    read_targets = False
-                if read_targets and len(line.split()) > 1:
-                    targets.append(line.split()[0])
-                if "Supported archs:" in line:
-                    read_targets = True
-            for line in iter(p.stderr.readline, ""):
-                if "native" in targets and "get_native_properties.sh" in line:
-                    targets.remove("native")
-                    break
-
-    except (OSError, subprocess.SubprocessError) as e:
-        print("Exception while executing make help:\n", e, sep="", file=sys.stderr)
-        raise FatalException("It appears 'make' is not properly installed")
-
-    if p.returncode != 0:
-        raise WorkerException(
-            "make help failed with return code {}".format(
-                format_return_code(p.returncode)
-            )
-        )
-
-    return targets
-
-
-def find_arch(compiler):
-    """Find the best arch string based on the cpu/g++ capabilities and Makefile targets"""
-    targets = make_targets()
-
-    # recent SF support a native target
-    if "native" in targets:
-        print("Using native target architecture")
-        return "native"
-
-    # older SF will need to fall back to this implementation
-    props = gcc_props() if compiler == "g++" else clang_props()
-
-    if is_64bit():
-        if (
-            IS_MACOS
-            and ("armv8" in props["arch"] or "apple-" in props["arch"])
-            and "apple-silicon" in targets
-        ):
-            arch = "apple-silicon"
-        elif (
-            "avx512vnni" in props["flags"]
-            and "avx512dq" in props["flags"]
-            and "avx512f" in props["flags"]
-            and "avx512bw" in props["flags"]
-            and "avx512vl" in props["flags"]
-            and "x86-64-vnni256" in targets
-        ):
-            arch = "x86-64-vnni256"
-        elif (
-            "avx512f" in props["flags"]
-            and "avx512bw" in props["flags"]
-            and "x86-64-avx512" in targets
-        ):
-            arch = "x86-64-avx512"
-            arch = "x86-64-bmi2"  # use bmi2 until avx512 performance becomes actually better
-        elif "avxvnni" in props["flags"] and "x86-64-avxvnni" in targets:
-            arch = "x86-64-avxvnni"
-        elif (
-            "bmi2" in props["flags"]
-            and "x86-64-bmi2" in targets
-            and props["arch"] not in ["znver1", "znver2"]
-        ):
-            arch = "x86-64-bmi2"
-        elif "avx2" in props["flags"] and "x86-64-avx2" in targets:
-            arch = "x86-64-avx2"
-        elif (
-            "popcnt" in props["flags"]
-            and "sse4.1" in props["flags"]
-            and "x86-64-sse41-popcnt" in targets
-        ):
-            arch = "x86-64-sse41-popcnt"
-        elif "ssse3" in props["flags"] and "x86-64-ssse3" in targets:
-            arch = "x86-64-ssse3"
-        elif (
-            "popcnt" in props["flags"]
-            and "sse3" in props["flags"]
-            and "x86-64-sse3-popcnt" in targets
-        ):
-            arch = "x86-64-sse3-popcnt"
-        else:
-            if props["arch"] in targets:
-                arch = props["arch"]
-            else:
-                arch = "x86-64"
-    else:
-        if (
-            "popcnt" in props["flags"]
-            and "sse4.1" in props["flags"]
-            and "x86-32-sse41-popcnt" in targets
-        ):
-            arch = "x86-32-sse41-popcnt"
-        elif "sse2" in props["flags"] and "x86-32-sse2" in targets:
-            arch = "x86-32-sse2"
-        else:
-            arch = "x86-32"
-
-    print("Available Makefile architecture targets: ", targets)
-    print("Available g++/cpu properties: ", props)
-    print("Determined the best architecture to be ", arch)
-
-    return arch
-
-
 def setup_engine(
-    destination, worker_dir, testing_dir, remote, sha, repo_url, concurrency, compiler
+    destination, worker_dir, testing_dir, remote, sha, repo_url, datagen=False
 ):
     """Download and build sources in a temporary directory then move exe to destination"""
     tmp_dir = Path(tempfile.mkdtemp(dir=worker_dir))
@@ -677,38 +458,25 @@ def setup_engine(
         blob = requests_get(item_url).content
         file_list = unzip(blob, tmp_dir)
         prefix = os.path.commonprefix([n.filename for n in file_list])
-        os.chdir(tmp_dir / prefix / "src")
+        os.chdir(tmp_dir / prefix)
 
-        for net in required_nets_from_source():
-            print("Build uses default net:", net)
-            establish_validated_net(remote, testing_dir, net)
-            shutil.copyfile(testing_dir / net, net)
+        evalfile = required_value_from_source()
+        print("Build uses default value net:", evalfile)
+        establish_validated_net(remote, testing_dir, evalfile)
+        shutil.copyfile(testing_dir / evalfile, evalfile)
 
-        arch = find_arch(compiler)
+        policyfile = required_policy_from_source()
+        print("Build uses default policy net:", policyfile)
+        establish_validated_net(remote, testing_dir, policyfile)
+        shutil.copyfile(testing_dir / policyfile, policyfile)
 
-        if compiler == "g++":
-            comp = "mingw" if IS_WINDOWS else "gcc"
-        elif compiler == "clang++":
-            comp = "clang"
+        cmd = ["make", "gen" if datagen else "montytest", f"EXE={destination}"]
 
-        # skip temporary the profiled build for apple silicon, see
-        # https://stackoverflow.com/questions/71580631/how-can-i-get-code-coverage-with-clang-13-0-1-on-mac
-        make_cmd = "build" if arch == "apple-silicon" else "profile-build"
-        cmd = [
-            "make",
-            f"-j{concurrency}",
-            f"{make_cmd}",
-            f"ARCH={arch}",
-            f"COMP={comp}",
-        ]
-
-        # append -DNNUE_EMBEDDING_OFF to existing CXXFLAGS environment variable, if any
-        cxx = os.environ.get("CXXFLAGS", "") + " -DNNUE_EMBEDDING_OFF"
-        env = dict(os.environ, CXXFLAGS=cxx.strip())
+        if os.path.exists(destination):
+            raise FatalException("Another worker is running in the same directory!")
 
         with subprocess.Popen(
             cmd,
-            env=env,
             start_new_session=False if IS_WINDOWS else True,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -726,30 +494,6 @@ def setup_engine(
                 )
         if p.returncode:
             raise WorkerException("Executing {} failed. Error: {}".format(cmd, errors))
-
-        cmd = ["make", "strip", f"COMP={comp}"]
-        try:
-            p = subprocess.run(
-                cmd,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            raise FatalException(
-                f"Executing {' '.join(cmd)} raised Exception: {type(e).__name__}: {e}",
-                e=e,
-            )
-        if p.returncode != 0:
-            raise FatalException(
-                f"Executing {' '.join(cmd)} failed. Error: {p.stderr.decode().strip()}",
-            )
-
-        # We called setup_engine() because the engine was not cached.
-        # Only another worker running in the same folder can have built the engine.
-        if os.path.exists(destination):
-            raise FatalException("Another worker is running in the same directory!")
-        else:
-            shutil.move("stockfish" + EXE_SUFFIX, destination)
     finally:
         os.chdir(worker_dir)
         shutil.rmtree(tmp_dir)
@@ -800,7 +544,7 @@ def adjust_tc(tc, factor):
     else:
         time_tc = float(chunks[0])
 
-    # Rebuild scaled_tc now: cutechess-cli and stockfish parse 3 decimal places.
+    # Rebuild scaled_tc now: cutechess-cli and monty parse 3 decimal places.
     scaled_tc = "{:.3f}".format(time_tc * factor)
     tc_limit = time_tc * factor * 3
     if increment > 0.0:
@@ -955,7 +699,7 @@ def parse_cutechess_output(
             raise RunException(message)
 
         # Parse line like this:
-        # Finished game 1 (stockfish vs base): 0-1 {White disconnects}
+        # Finished game 1 (monty vs base): 0-1 {White disconnects}
         if "disconnects" in line or "connection stalls" in line:
             result["stats"]["crashes"] += 1
 
@@ -963,7 +707,7 @@ def parse_cutechess_output(
             result["stats"]["time_losses"] += 1
 
         # Parse line like this:
-        # Score of stockfish vs base: 0 - 0 - 1  [0.500] 1
+        # Score of monty vs base: 0 - 0 - 1  [0.500] 1
         if "Score" in line:
             # Parsing sometimes fails. We want to understand why.
             try:
@@ -1182,7 +926,14 @@ def launch_cutechess(
 
 
 def run_games(
-    worker_info, current_state, password, remote, run, task_id, pgn_file, clear_binaries
+    worker_info,
+    current_state,
+    password,
+    remote,
+    run,
+    task_id,
+    games_file,
+    clear_binaries,
 ):
     # This is the main cutechess-cli driver.
     # It is ok, and even expected, for this function to
@@ -1233,9 +984,6 @@ def run_games(
 
     games_remaining = task["num_games"] - input_total_games
 
-    assert games_remaining > 0
-    assert games_remaining % 2 == 0
-
     book = run["args"]["book"]
     book_depth = run["args"]["book_depth"]
     new_options = run["args"]["new_options"]
@@ -1245,6 +993,23 @@ def run_games(
     repo_url = run["args"].get("tests_repo")
     worker_concurrency = int(worker_info["concurrency"])
     games_concurrency = worker_concurrency // threads
+
+    if run["args"].get("datagen", False):
+        run_datagen_games(
+            games_file,
+            book,
+            worker_concurrency,
+            games_remaining,
+            run,
+            remote,
+            worker_info["unique_key"],
+            result,
+            current_state,
+        )
+        return
+
+    assert games_remaining > 0
+    assert games_remaining % 2 == 0
 
     opening_offset = task.get("start", task_id * task["num_games"])
     if "start" in task:
@@ -1274,7 +1039,7 @@ def run_games(
     num_bkps = 0 if clear_binaries else 50
     try:
         engines = sorted(
-            testing_dir.glob("stockfish_*" + EXE_SUFFIX),
+            testing_dir.glob("monty_*" + EXE_SUFFIX),
             key=os.path.getmtime,
             reverse=True,
         )
@@ -1299,14 +1064,14 @@ def run_games(
     # Create new engines.
     sha_new = run["args"]["resolved_new"]
     sha_base = run["args"]["resolved_base"]
-    new_engine_name = "stockfish_" + sha_new
-    base_engine_name = "stockfish_" + sha_base
+    new_engine_name = "monty_" + sha_new
+    base_engine_name = "monty_" + sha_base
 
-    new_engine = testing_dir / (new_engine_name + EXE_SUFFIX)
-    base_engine = testing_dir / (base_engine_name + EXE_SUFFIX)
+    new_engine = testing_dir / new_engine_name
+    base_engine = testing_dir / base_engine_name
 
     # Build from sources new and base engines as needed.
-    if not new_engine.exists():
+    if not new_engine.with_suffix(EXE_SUFFIX).exists():
         setup_engine(
             new_engine,
             worker_dir,
@@ -1314,10 +1079,8 @@ def run_games(
             remote,
             sha_new,
             repo_url,
-            worker_info["concurrency"],
-            worker_info["compiler"],
         )
-    if not base_engine.exists():
+    if not base_engine.with_suffix(EXE_SUFFIX).exists():
         setup_engine(
             base_engine,
             worker_dir,
@@ -1325,8 +1088,6 @@ def run_games(
             remote,
             sha_base,
             repo_url,
-            worker_info["concurrency"],
-            worker_info["compiler"],
         )
 
     os.chdir(testing_dir)
@@ -1345,7 +1106,7 @@ def run_games(
     # Clean up the old networks (keeping the num_bkps most recent)
     num_bkps = 10
     for old_net in sorted(
-        testing_dir.glob("nn-*.nnue"), key=os.path.getmtime, reverse=True
+        testing_dir.glob("nn-*.network"), key=os.path.getmtime, reverse=True
     )[num_bkps:]:
         try:
             old_net.unlink()
@@ -1357,28 +1118,19 @@ def run_games(
                 file=sys.stderr,
             )
 
-    # Add EvalFile* with full path to cutechess options, and download the networks if missing.
-    for option, net in required_nets(base_engine).items():
-        base_options.append("option.{}={}".format(option, net))
-        establish_validated_net(remote, testing_dir, net)
-
-    for option, net in required_nets(new_engine).items():
-        new_options.append("option.{}={}".format(option, net))
-        establish_validated_net(remote, testing_dir, net)
-
     # PGN files output setup.
-    pgn_name = "results-" + worker_info["unique_key"] + ".pgn"
-    pgn_file[0] = testing_dir / pgn_name
-    pgn_file = pgn_file[0]
+    games_name = "results-" + worker_info["unique_key"] + ".pgn"
+    games_file[0] = testing_dir / games_name
+    games_file = games_file[0]
     try:
-        pgn_file.unlink()
+        games_file.unlink()
     except FileNotFoundError:
         pass
 
     # Verify that the signatures are correct.
     run_errors = []
     try:
-        base_nps, cpu_features = verify_signature(
+        base_nps = verify_signature(
             base_engine,
             run["args"]["base_signature"],
             games_concurrency * threads,
@@ -1407,16 +1159,16 @@ def run_games(
     if run_errors:
         raise RunException("\n".join(run_errors))
 
-    if base_nps < 208082 / (1 + math.tanh((worker_concurrency - 1) / 8)):
+    if base_nps < 61362 / (1 + math.tanh((worker_concurrency - 1) / 8)):
         raise FatalException(
-            "This machine is too slow ({} nps / thread) to run fishtest effectively - sorry!".format(
+            "This machine is too slow ({} nps / thread) to run montytest effectively - sorry!".format(
                 base_nps
             )
         )
-    # fishtest with Stockfish 11 had 1.6 Mnps as reference nps and
-    # 0.7 Mnps as threshold for the slow worker.
+
+    # Value from running bench on 32 processes on Ryzen 9 7950X
     # also set in rundb.py and delta_update_users.py
-    factor = 691680 / base_nps
+    factor = BASELINE_NPS / base_nps
 
     # Adjust CPU scaling.
     _, tc_limit_ltc = adjust_tc("60+0.6", factor)
@@ -1427,11 +1179,11 @@ def run_games(
         tc_limit = (tc_limit + new_tc_limit) / 2
 
     result["worker_info"]["nps"] = float(base_nps)
-    result["worker_info"]["ARCH"] = cpu_features
 
     threads_cmd = []
-    if not any("Threads" in s for s in new_options + base_options):
-        threads_cmd = ["option.Threads={}".format(threads)]
+    # This is disabled for now because monty doesn't have the Threads option
+    # if not any("Threads" in s for s in new_options + base_options):
+    #     threads_cmd = ["option.Threads={}".format(threads)]
 
     # If nodestime is being used, give engines extra grace time to
     # make time losses virtually impossible.
@@ -1455,7 +1207,7 @@ def run_games(
             pgnout = []
         else:
             games_to_play = games_remaining
-            pgnout = ["-pgnout", pgn_name]
+            pgnout = ["-pgnout", games_name]
 
         if "sprt" in run["args"]:
             batch_size = 2 * run["args"]["sprt"].get("batch_size", 1)
@@ -1500,7 +1252,7 @@ def run_games(
                 "gauntlet",
             ]
             + pgnout
-            + ["-site", "https://tests.stockfishchess.org/tests/view/" + run["_id"]]
+            + ["-site", "https://montychess.org/tests/view/" + run["_id"]]
             + [
                 "-event",
                 "Batch {}: {} vs {}".format(
@@ -1567,5 +1319,230 @@ def run_games(
 
         if not task_alive:
             break
+
+    return
+
+
+def parse_datagen_output(p, tc_factor, result, remote, current_state):
+    saved_stats = copy.deepcopy(result["stats"])
+
+    q = Queue()
+    t_output = threading.Thread(target=enqueue_output, args=(p.stdout, q), daemon=True)
+    t_output.start()
+    t_error = threading.Thread(target=enqueue_output, args=(p.stderr, q), daemon=True)
+    t_error.start()
+
+    tc_limit = tc_factor * 1800 * 1.5  # Allow 50% more time before excepting
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=tc_limit)
+    print("TC limit {} End time: {}".format(tc_limit, end_time))
+
+    while datetime.now(timezone.utc) < end_time:
+        try:
+            line = q.get_nowait().strip()
+        except Empty:
+            if p.poll() is not None:
+                break
+            time.sleep(1)
+            continue
+
+        print(line, flush=True)
+
+        if "finished games" in line:
+            # Parsing sometimes fails. We want to understand why.
+            try:
+                chunks = line.split(" ")
+                wld = [int(chunks[8]), int(chunks[4]), int(chunks[6])]
+            except:
+                raise WorkerException("Failed to parse score line: {}".format(line))
+    else:
+        raise WorkerException(
+            "{} is past end time {}".format(datetime.now(timezone.utc), end_time)
+        )
+
+    result["stats"]["wins"] = wld[0] + saved_stats["wins"]
+    result["stats"]["losses"] = wld[1] + saved_stats["losses"]
+    result["stats"]["draws"] = wld[2] + saved_stats["draws"]
+
+    wins = result["stats"]["wins"]
+    draws = result["stats"]["draws"]
+    losses = result["stats"]["losses"]
+
+    winLossDiff = wins - losses
+
+    result["stats"]["pentanomial"][1] = max(-winLossDiff, 0)
+    result["stats"]["pentanomial"][2] = int(
+        (wins + draws + losses) / 2 - abs(winLossDiff)
+    )
+    result["stats"]["pentanomial"][3] = max(winLossDiff, 0)
+
+    update_succeeded = False
+    for _ in range(5):
+        try:
+            response = send_api_post_request(remote + "/api/update_task", result)
+            if "error" in response:
+                break
+        except Exception as e:
+            print(
+                "Exception calling update_task:\n",
+                e,
+                sep="",
+                file=sys.stderr,
+            )
+            if isinstance(e, FatalException):  # signal
+                raise e
+        else:
+            if not response["task_alive"]:
+                # This task is no longer necessary
+                print(
+                    "The server told us that no more games"
+                    " are needed for the current task."
+                )
+                return False
+            update_succeeded = True
+            break
+        time.sleep(UPDATE_RETRY_TIME)
+    if not update_succeeded:
+        raise WorkerException("Too many failed update attempts")
+    else:
+        current_state["last_updated"] = datetime.now(timezone.utc)
+
+    return True
+
+
+def run_datagen_games(
+    games_file,
+    book,
+    threads,
+    games,
+    run,
+    remote,
+    key,
+    result,
+    current_state,
+):
+    sha_new = run["args"]["resolved_new"]
+    new_engine_name = "monty_datagen_" + sha_new
+
+    repo_url = run["args"].get("tests_repo")
+    worker_dir = Path(__file__).resolve().parent
+    testing_dir = worker_dir / "testing"
+
+    new_engine = testing_dir / new_engine_name
+
+    # Build from sources new and base engines as needed.
+    if not new_engine.with_suffix(EXE_SUFFIX).exists():
+        setup_engine(
+            new_engine,
+            worker_dir,
+            testing_dir,
+            remote,
+            sha_new,
+            repo_url,
+            datagen=True,
+        )
+
+    os.chdir(testing_dir)
+
+    # Download the opening book if missing in the directory.
+    if not (testing_dir / book).exists() or (testing_dir / book).stat().st_size == 0:
+        zipball = book + ".zip"
+        blob = download_from_github(zipball)
+        unzip(blob, testing_dir)
+
+    # convert .epd containing FENs into .epd containing EPDs with move counters
+    # only needed as long as cutechess-cli is the game manager
+    if book.endswith(".epd"):
+        convert_book_move_counters(testing_dir / book)
+
+    # Verify that the signatures are correct.
+    run_errors = []
+    try:
+        nps = verify_signature(
+            new_engine,
+            run["args"]["base_signature"],
+            threads,
+        )
+    except RunException as e:
+        run_errors.append(str(e))
+    except WorkerException as e:
+        raise e
+
+    tc_factor = BASELINE_NPS / nps
+
+    # Handle exceptions if any.
+    if run_errors:
+        raise RunException("\n".join(run_errors))
+
+    games_name = "data-" + key + ".binpack"
+    games_file[0] = testing_dir / games_name
+    games_file = games_file[0]
+    try:
+        games_file.unlink()
+    except FileNotFoundError:
+        pass
+
+    nodes = run["args"]["nodes"]
+
+    cmd = [
+        new_engine_name,
+        "-o",
+        games_name,
+        "-n",
+        str(nodes),
+        "-t",
+        str(threads),
+        "-g",
+        str(games),
+    ]
+
+    if book is not None and book.endswith(".epd"):
+        cmd.append("-b")
+        cmd.append(book)
+
+    try:
+        with subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1,
+            # The next options are necessary to be able to send a CTRL_C_EVENT to this process.
+            # https://stackoverflow.com/questions/7085604/sending-c-to-python-subprocess-objects-on-windows
+            startupinfo=(
+                subprocess.STARTUPINFO(
+                    dwFlags=subprocess.STARTF_USESHOWWINDOW,
+                    wShowWindow=subprocess.SW_HIDE,
+                )
+                if IS_WINDOWS
+                else None
+            ),
+            creationflags=subprocess.CREATE_NEW_CONSOLE if IS_WINDOWS else 0,
+            close_fds=not IS_WINDOWS,
+        ) as p:
+            try:
+                parse_datagen_output(p, tc_factor, result, remote, current_state)
+            finally:
+                # We nicely ask cutechess-cli to stop.
+                try:
+                    send_sigint(p)
+                except Exception as e:
+                    print("\nException in send_sigint:\n", e, sep="", file=sys.stderr)
+                # now wait...
+                print("\nWaiting for datagen to finish ... ", end="", flush=True)
+                try:
+                    p.wait(timeout=CUTECHESS_KILL_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    print("timeout", flush=True)
+                    kill_process(p)
+                else:
+                    print("done", flush=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(
+            "Exception starting datagen:\n",
+            e,
+            sep="",
+            file=sys.stderr,
+        )
+        raise WorkerException("Unable to start datagen. Error: {}".format(str(e)))
 
     return

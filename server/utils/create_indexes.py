@@ -11,11 +11,11 @@ import sys
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 
-db_name = "fishtest_new"
+db_name = "montytest_new"
 
 # MongoDB server is assumed to be on the same machine, if not user should use
 # ssh with port forwarding to access the remote host.
-conn = MongoClient(os.getenv("FISHTEST_HOST") or "localhost")
+conn = MongoClient(os.getenv("MONTYTEST_HOST") or "localhost")
 db = conn[db_name]
 
 
@@ -76,6 +76,11 @@ def create_runs_indexes():
 def create_pgns_indexes():
     print("Creating indexes on pgns collection")
     db["pgns"].create_index([("run_id", DESCENDING)])
+
+
+def create_vtd_indexes():
+    print("Creating indexes on vtd collection")
+    db["vtd"].create_index([("run_id", DESCENDING)])
 
 
 def create_nns_indexes():
@@ -155,6 +160,9 @@ if __name__ == "__main__":
             elif collection_name == "pgns":
                 drop_indexes("pgns")
                 create_pgns_indexes()
+            elif collection_name == "vtd":
+                drop_indexes("vtd")
+                create_vtd_indexes()
             elif collection_name == "nns":
                 drop_indexes("nns")
                 create_nns_indexes()

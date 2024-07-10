@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 import util
-from fishtest.views import login, signup
+from montytest.views import login, signup
 from pyramid import testing
 
 
@@ -29,7 +29,7 @@ class Create10UsersTest(unittest.TestCase):
                 "password": "secret",
                 "password2": "secret",
                 "email": "joe@user.net",
-                "tests_repo": "https://github.com/official-stockfish/Stockfish",
+                "tests_repo": "https://github.com/official-monty/Monty",
             },
         )
         response = signup(request)
@@ -43,7 +43,7 @@ class Create50LoginTest(unittest.TestCase):
             "JoeUser",
             "secret",
             "email@email.email",
-            "https://github.com/official-stockfish/Stockfish",
+            "https://github.com/official-monty/Monty",
         )
         self.config = testing.setUp()
         self.config.add_route("login", "/login")

@@ -28,10 +28,10 @@ from functools import partial
 from pathlib import Path
 
 # Fall back to the provided packages if missing in the local system.
-
 packages_dir = Path(__file__).resolve().parent / "packages"
 sys.path.append(str(packages_dir))
 
+import cpuinfo
 import requests
 from games import (
     EXE_SUFFIX,
@@ -55,14 +55,11 @@ from updater import update
 # Several packages are called "expression".
 # So we make sure to use the locally installed one.
 
-# Minimum requirement of compiler version for Stockfish.
-MIN_GCC_MAJOR = 7
-MIN_GCC_MINOR = 3
+# Minimum requirement of compiler version for Monty.
+MIN_CARGO_MAJOR = 1
+MIN_CARGO_MINOR = 77
 
-MIN_CLANG_MAJOR = 8
-MIN_CLANG_MINOR = 0
-
-WORKER_VERSION = 239
+WORKER_VERSION = 1
 FILE_LIST = ["updater.py", "worker.py", "games.py"]
 HTTP_TIMEOUT = 30.0
 INITIAL_RETRY_TIME = 15.0
@@ -76,7 +73,7 @@ try:
     del google.colab
 except:
     pass
-CONFIGFILE = "fishtest.cfg"
+CONFIGFILE = "montytest.cfg"
 
 LOGO = r"""
 ______ _     _     _            _                        _
@@ -103,31 +100,31 @@ games.py  :             parse_cutechess_output()
 Apis used by the worker
 =======================
 
-<fishtest>     = https://tests.stockfishchess.org
+<montytest>     = https://montychess.org
 <github>       = https://api.github.com
-<github-books> = <github>/repos/official-stockfish/books
+<github-books> = <github>/repos/official-monty/books
 
-Heartbeat           <fishtest>/api/beat                                         POST
+Heartbeat           <montytest>/api/beat                                         POST
 
 Setup task          <github>/rate_limit                                         GET
-                    <fishtest>/api/request_version                              POST
-                    <fishtest>/api/request_task                                 POST
-                    <fishtest>/api/nn/<nnue>                                    GET
+                    <montytest>/api/request_version                              POST
+                    <montytest>/api/request_task                                 POST
+                    <montytest>/api/nn/<nnue>                                    GET
                     <github-books>/git/trees/master                             GET
                     <github-books>/git/trees/master/blobs/<sha-cutechess-cli>   GET
                     <github-books>/git/trees/master/blobs/<sha-book>            GET
                     <github>/repos/<user-repo>/zipball/<sha>                    GET
 
-Main loop           <fishtest>/api/update_task                                  POST
-                    <fishtest>/api/request_spsa                                 POST
+Main loop           <montytest>/api/update_task                                  POST
+                    <montytest>/api/request_spsa                                 POST
 
-Finish task         <fishtest>/api/failed_task                                  POST
-                    <fishtest>/api/stop_run                                     POST
-                    <fishtest>/api/upload_pgn                                   POST
+Finish task         <montytest>/api/failed_task                                  POST
+                    <montytest>/api/stop_run                                     POST
+                    <montytest>/api/upload_pgn                                   POST
 
 
 The POST requests are json encoded. For the shape of a valid request, consult
-"api.py" in the Fishtest source.
+"api.py" in the montytest source.
 
 The POST requests return a json encoded dictionary. It may contain a key "error".
 In that case the corresponding value is an error message.
@@ -292,7 +289,7 @@ def download_sri():
     try:
         return json.loads(
             download_from_github(
-                "worker/sri.txt", owner="official-stockfish", repo="fishtest"
+                "worker/sri.txt", owner="official-monty", repo="montytest"
             )
         )
     except:
@@ -632,17 +629,17 @@ def setup_parameters(worker_dir):
     # ones by defaults.
 
     compiler_names = list(compilers.keys())
-    if "g++" not in compiler_names:
+    if "cargo" not in compiler_names:
         default_compiler = compiler_names[0]
     else:
-        default_compiler = "g++"
+        default_compiler = "cargo"
 
     schema = [
         # (<section>, <option>, <default>, <type>, <preprocessor>),
         ("login", "username", "", str, None),
         ("login", "password", "", str, None),
         ("parameters", "protocol", "https", ["http", "https"], None),
-        ("parameters", "host", "tests.stockfishchess.org", str, None),
+        ("parameters", "host", "montychess.org", str, None),
         ("parameters", "port", "443", int, None),
         (
             "parameters",
@@ -692,7 +689,7 @@ def setup_parameters(worker_dir):
         "--host",
         dest="host",
         default=config.get("parameters", "host"),
-        help="the hostname of the fishtest server",
+        help="the hostname of the montytest server",
     )
     parser.add_argument(
         "-p",
@@ -700,7 +697,7 @@ def setup_parameters(worker_dir):
         dest="port",
         default=config.getint("parameters", "port"),
         type=int,
-        help="the port of the fishtest server",
+        help="the port of the montytest server",
     )
     parser.add_argument(
         "-c",
@@ -1018,11 +1015,11 @@ def get_remaining_github_api_calls():
         return 0
 
 
-def gcc_version():
-    """Parse the output of g++ -E -dM -"""
+def cargo_version():
+    """Parse the output of cargo --version"""
     try:
         with subprocess.Popen(
-            ["g++", "-E", "-dM", "-"],
+            ["cargo", "--version"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             universal_newlines=True,
@@ -1030,108 +1027,45 @@ def gcc_version():
             close_fds=not IS_WINDOWS,
         ) as p:
             for line in iter(p.stdout.readline, ""):
-                if "__clang_major__" in line:
-                    print("clang++ poses as g++")
-                    return None
-                if "__GNUC__" in line:
-                    major = line.split()[2]
-                if "__GNUC_MINOR__" in line:
-                    minor = line.split()[2]
-                if "__GNUC_PATCHLEVEL__" in line:
-                    patchlevel = line.split()[2]
+                if "cargo" in line:
+                    ver = line.split(" ")[1].split(".")
+                    major = ver[0]
+                    minor = ver[1]
+                    patchlevel = ver[2]
     except (OSError, subprocess.SubprocessError):
-        print("No g++ or g++ is not executable")
+        print("No cargo or cargo is not executable")
         return None
     if p.returncode != 0:
-        print("g++ version query failed with return code {}".format(p.returncode))
+        print("cargo version query failed with return code {}".format(p.returncode))
         return None
 
     try:
         major = int(major)
         minor = int(minor)
         patchlevel = int(patchlevel)
-        compiler = "g++"
+        compiler = "cargo"
     except:
-        print("Failed to parse g++ version.")
+        print("Failed to parse cargo version.")
         return None
 
-    if (major, minor) < (MIN_GCC_MAJOR, MIN_GCC_MINOR):
+    if (major, minor) < (MIN_CARGO_MAJOR, MIN_CARGO_MINOR):
         print(
-            "Found g++ version {}.{}.{}. First usable version is {}.{}.0".format(
-                major, minor, patchlevel, MIN_GCC_MAJOR, MIN_GCC_MINOR
+            "Found cargo version {}.{}.{}. First usable version is {}.{}.0".format(
+                major, minor, patchlevel, MIN_CARGO_MAJOR, MIN_CARGO_MINOR
             )
         )
         return None
-    print("Found {} version {}.{}.{}".format(compiler, major, minor, patchlevel))
-    return (compiler, major, minor, patchlevel)
-
-
-def clang_version():
-    """Parse the output of clang++ -E -dM -"""
-    try:
-        with subprocess.Popen(
-            ["clang++", "-E", "-dM", "-"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1,
-            close_fds=not IS_WINDOWS,
-        ) as p:
-            for line in iter(p.stdout.readline, ""):
-                if "__clang_major__" in line:
-                    clang_major = line.split()[2]
-                if "__clang_minor__" in line:
-                    clang_minor = line.split()[2]
-                if "__clang_patchlevel__" in line:
-                    clang_patchlevel = line.split()[2]
-    except (OSError, subprocess.SubprocessError):
-        print("No clang++ or clang++ is not executable")
-        return None
-    if p.returncode != 0:
-        print("clang++ version query failed with return code {}".format(p.returncode))
-        return None
-    try:
-        major = int(clang_major)
-        minor = int(clang_minor)
-        patchlevel = int(clang_patchlevel)
-        compiler = "clang++"
-    except:
-        print("Failed to parse clang++ version.")
-        return None
-
-    if (major, minor) < (MIN_CLANG_MAJOR, MIN_CLANG_MINOR):
-        print(
-            "Found clang++ version {}.{}.{}. First usable version is {}.{}.0".format(
-                major, minor, patchlevel, MIN_CLANG_MAJOR, MIN_CLANG_MINOR
-            )
-        )
-        return None
-
-    # Check for a common toolchain issue
-    try:
-        subprocess.run(
-            (["xcrun"] if IS_MACOS else []) + ["llvm-profdata", "--help"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        print(
-            "clang++ is present but misconfigured: the command 'llvm-profdata' is missing"
-        )
-        return None
-
     print("Found {} version {}.{}.{}".format(compiler, major, minor, patchlevel))
     return (compiler, major, minor, patchlevel)
 
 
 def detect_compilers():
     ret = {}
-    gcc_version_ = gcc_version()
-    if gcc_version_ is not None:
-        ret["g++"] = gcc_version_
-    clang_version_ = clang_version()
-    if clang_version_ is not None:
-        ret["clang++"] = clang_version_
+
+    cargo_version_ = cargo_version()
+    if cargo_version_ is not None:
+        ret["cargo"] = cargo_version_
+
     return ret
 
 
@@ -1432,7 +1366,7 @@ def fetch_and_handle_task(
     message = ""
     server_message = ""
     api = remote + "/api/failed_task"
-    pgn_file = [None]
+    games_file = [None]
     try:
         run_games(
             worker_info,
@@ -1441,7 +1375,7 @@ def fetch_and_handle_task(
             remote,
             run,
             task_id,
-            pgn_file,
+            games_file,
             clear_binaries,
         )
         success = True
@@ -1480,13 +1414,37 @@ def fetch_and_handle_task(
         except Exception as e:
             print("Exception posting failed_task:\n", e, sep="", file=sys.stderr)
     # Upload PGN file.
-    if pgn_file[0] is not None:
-        pgn_file = pgn_file[0]
-        if pgn_file.exists():
-            if "spsa" not in run["args"]:
+    if games_file[0] is not None:
+        games_file = games_file[0]
+        if games_file.exists():
+            if run["args"].get("datagen", False):
+                try:
+                    data = games_file.read_bytes()
+                    with io.BytesIO() as gz_buffer:
+                        with gzip.GzipFile(
+                            filename=f"{str(run['_id'])}-{task_id}.binpack.gz",
+                            mode="wb",
+                            fileobj=gz_buffer,
+                        ) as gz:
+                            gz.write(data)
+                        payload["vtd"] = base64.b64encode(gz_buffer.getvalue()).decode()
+                    print(
+                        "Uploading compressed binpack of {} bytes".format(
+                            len(payload["vtd"])
+                        )
+                    )
+                    req = send_api_post_request(remote + "/api/upload_vtd", payload)
+                except Exception as e:
+                    print(
+                        "\nException uploading binpack file:\n",
+                        e,
+                        sep="",
+                        file=sys.stderr,
+                    )
+            elif "spsa" not in run["args"]:
                 try:
                     # Ignore non utf-8 characters in PGN file.
-                    data = pgn_file.read_text(encoding="utf-8", errors="ignore")
+                    data = games_file.read_text(encoding="utf-8", errors="ignore")
                     with io.BytesIO() as gz_buffer:
                         with gzip.GzipFile(
                             filename=f"{str(run['_id'])}-{task_id}.pgn.gz",
@@ -1507,7 +1465,7 @@ def fetch_and_handle_task(
                     )
 
             try:
-                pgn_file.unlink()
+                games_file.unlink()
             except Exception as e:
                 print("Exception deleting PGN file:\n", e, sep="", file=sys.stderr)
 
@@ -1615,6 +1573,18 @@ def worker():
     compiler, major, minor, patchlevel = options.compiler
     print("Using {} {}.{}.{}".format(compiler, major, minor, patchlevel))
 
+    try:
+        brand = cpuinfo.get_cpu_info()["brand_raw"]
+    except:
+        brand = "?"
+
+    try:
+        freq = cpuinfo.get_cpu_info()["hz_actual_friendly"]
+    except:
+        freq = ""
+
+    cpu = "{} {}".format(brand, freq)
+
     uname = platform.uname()
     worker_info = {
         "uname": uname[0] + " " + uname[2] + (" (colab)" if IS_COLAB else ""),
@@ -1629,7 +1599,7 @@ def worker():
             sys.version_info.minor,
             sys.version_info.micro,
         ),
-        "gcc_version": (
+        "cargo_version": (
             major,
             minor,
             patchlevel,
@@ -1637,7 +1607,7 @@ def worker():
         "compiler": compiler,
         "unique_key": get_uuid(options),
         "modified": not unmodified,
-        "ARCH": "?",
+        "ARCH": cpu,
         "nps": 0.0,
     }
 
@@ -1660,13 +1630,13 @@ def worker():
 
     # Start the main loop.
     delay = INITIAL_RETRY_TIME
-    fish_exit = False
+    monty_exit = False
     clear_binaries = True
     while current_state["alive"]:
-        if (worker_dir / "fish.exit").is_file():
+        if (worker_dir / "monty.exit").is_file():
             current_state["alive"] = False
-            print("Stopped by 'fish.exit' file")
-            fish_exit = True
+            print("Stopped by 'monty.exit' file")
+            monty_exit = True
             break
         success = fetch_and_handle_task(
             worker_info,
@@ -1691,13 +1661,13 @@ def worker():
             clear_binaries = False
             delay = INITIAL_RETRY_TIME
 
-    if fish_exit:
-        (worker_dir / "fish.exit").unlink()
+    if monty_exit:
+        (worker_dir / "monty.exit").unlink()
 
     print("Waiting for the heartbeat thread to finish...")
     heartbeat_thread.join(THREAD_JOIN_TIMEOUT)
 
-    return 0 if fish_exit else 1
+    return 0 if monty_exit else 1
 
 
 if __name__ == "__main__":
